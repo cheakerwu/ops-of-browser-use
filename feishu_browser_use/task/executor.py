@@ -23,6 +23,7 @@ from feishu_browser_use.account.manager import AccountManager
 from feishu_browser_use.account.models import AccountStatus
 from feishu_browser_use.config import Settings
 from feishu_browser_use.feishu.bot import FeishuBot
+from feishu_browser_use.prompting import PromptRegistry
 from feishu_browser_use.platforms import PlatformAdapter, get_adapter
 from feishu_browser_use.task.models import Task, TaskResult, TaskStatus
 from feishu_browser_use.task.queue import TaskQueue
@@ -82,7 +83,7 @@ class TaskExecutor:
 
 			# Execute the task
 			await self._notify(task.chat_id, f"🔄 任务 {task.id[:8]} 开始执行...")
-			await self._queue.update_status(task.id, TaskStatus.EXECUTING)
+			await self._set_status(task, TaskStatus.EXECUTING)
 
 			result = await self._run_task(
 				task=task,
@@ -110,7 +111,7 @@ class TaskExecutor:
 				)
 
 			# Task completed — send evidence screenshots
-			await self._queue.update_status(task.id, TaskStatus.COMPLETED, result=result)
+			await self._set_status(task, TaskStatus.COMPLETED, result=result)
 			await self._send_evidence(task, evidence_screenshots)
 
 			return result
@@ -147,8 +148,9 @@ class TaskExecutor:
 			if cancel_event and cancel_event.is_set():
 				raise asyncio.CancelledError()
 
-			# Build task prompt
-			task_prompt = adapter.build_task_prompt(task.instruction, {"phase": "execute"})
+			# Build task prompt from structured, policy-checked task fields.
+			task.prompt_version = PromptRegistry.VERSION
+			task_prompt = PromptRegistry().build(task, phase="execute")
 
 			# Create LLM instance
 			llm = ChatOpenAI(
@@ -225,8 +227,20 @@ class TaskExecutor:
 
 		result_str = str(agent_result).lower()
 		login_indicators = [
-			"login", "登录", "sign in", "signin",
-			"passport", "auth", "账号密码",
+			"需要重新登录",
+			"需要用户手动登录",
+			"登录态失效",
+			"停留在登录页",
+			"当前是登录页",
+			"当前显示登录",
+			"无法继续",
+			"blocked on authentication",
+			"authentication required",
+			"requires login",
+			"login required",
+			"sign in required",
+			"please sign in",
+			"please login",
 		]
 
 		for indicator in login_indicators:
@@ -258,12 +272,26 @@ class TaskExecutor:
 
 	async def _handle_failure(self, task: Task, result: TaskResult) -> None:
 		"""Handle task failure: update status and notify user."""
-		await self._queue.update_status(task.id, TaskStatus.FAILED, error=result.message)
+		await self._set_status(
+			task,
+			TaskStatus.FAILED,
+			error=result.message,
+			error_type="execution_failed",
+			error_message_user=result.message,
+			error_message_internal=result.message,
+		)
 		await self._notify(task.chat_id, f"❌ 任务 {task.id[:8]} 失败: {result.message}")
 
 	async def _handle_cancel(self, task: Task, browser_session: BrowserSession | None) -> TaskResult:
 		"""Handle task cancellation: update status, close browser, notify user."""
-		await self._queue.update_status(task.id, TaskStatus.CANCELLED, error="用户取消")
+		await self._set_status(
+			task,
+			TaskStatus.CANCELLED,
+			error="用户取消",
+			error_type="user_cancelled",
+			error_message_user="用户取消",
+			error_message_internal="用户取消",
+		)
 		await self._notify(task.chat_id, f"🛑 任务 {task.id[:8]} 已取消")
 		return TaskResult(success=False, message="用户取消")
 
@@ -272,8 +300,13 @@ class TaskExecutor:
 		if task.account_id:
 			await self._account_manager.update_status(task.account_id, AccountStatus.NEEDS_LOGIN)
 
-		await self._queue.update_status(
-			task.id, TaskStatus.FAILED, error="登录态失效，需要重新登录"
+		await self._set_status(
+			task,
+			TaskStatus.FAILED,
+			error="登录态失效，需要重新登录",
+			error_type="needs_login",
+			error_message_user="登录态失效，需要重新登录",
+			error_message_internal="登录态失效，需要重新登录",
 		)
 
 		await self._notify(
@@ -281,6 +314,18 @@ class TaskExecutor:
 			f"⚠️ 任务 {task.id[:8]} 需要重新登录\n"
 			f"请发送 \"登录 {task.platform} <账号名>\" 重新登录后重试",
 		)
+
+	async def _set_status(self, task: Task, status: TaskStatus, **kwargs) -> None:
+		"""Persist task status and refresh its Feishu task card when possible."""
+		await self._queue.update_status(task.id, status, **kwargs)
+		task.status = status
+		for key, value in kwargs.items():
+			if hasattr(task, key):
+				setattr(task, key, value)
+		try:
+			await self._feishu_bot.update_task_card(task)
+		except Exception:
+			logger.warning("Failed to update task card for %s", task.id, exc_info=True)
 
 	async def _send_evidence(self, task: Task, screenshot_paths: list[str]) -> None:
 		"""Send evidence screenshots to the Feishu user."""
@@ -296,15 +341,33 @@ class TaskExecutor:
 			# Upload image to Feishu and get image_key
 			image_key = await self._feishu_bot.upload_image(last_screenshot)
 			if image_key:
+				await self._queue.add_event(
+					task.id,
+					"evidence_uploaded",
+					"截图证据已上传",
+					{"image_key": image_key},
+				)
 				await self._feishu_bot.send_image(task.chat_id, image_key)
 				await self._notify(
 					task.chat_id,
 					f"✅ 任务 {task.id[:8]} 执行成功！\n📸 以上为执行截图证据",
 				)
 			else:
+				await self._queue.add_event(
+					task.id,
+					"evidence_upload_failed",
+					"截图上传失败",
+					{"path": last_screenshot},
+				)
 				await self._notify(task.chat_id, f"✅ 任务 {task.id[:8]} 执行成功！（截图上传失败）")
 		except Exception:
 			logger.warning("Failed to send evidence screenshot", exc_info=True)
+			await self._queue.add_event(
+				task.id,
+				"evidence_send_failed",
+				"截图发送失败",
+				{"path": last_screenshot},
+			)
 			await self._notify(task.chat_id, f"✅ 任务 {task.id[:8]} 执行成功！（截图发送失败）")
 
 	async def _notify(self, chat_id: str, text: str) -> None:

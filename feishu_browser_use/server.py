@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -17,8 +18,11 @@ from feishu_browser_use.account.models import AccountStatus
 from feishu_browser_use.config import Settings, get_config
 from feishu_browser_use.feishu.bot import FeishuBot
 from feishu_browser_use.feishu.client import get_feishu_client
+from feishu_browser_use.intent import IntentParser
+from feishu_browser_use.policy import PolicyGate
+from feishu_browser_use.prompting import PromptRegistry
 from feishu_browser_use.task.executor import TaskExecutor
-from feishu_browser_use.task.models import Task, TaskStatus
+from feishu_browser_use.task.models import Attachment, Task, TaskStatus
 from feishu_browser_use.task.pool import TaskExecutorPool
 from feishu_browser_use.task.queue import TaskQueue
 
@@ -131,13 +135,14 @@ async def feishu_webhook(request: Request) -> Response:
 	# 3) Event callback v2.0 (wrapped in "header" + "event")
 	header = body.get("header", {})
 	event_type = header.get("event_type", "")
+	tenant_key = header.get("tenant_key", "")
 	event = body.get("event", {})
 
 	logger.info("Feishu event received: type=%s", event_type)
 
 	if event_type == "im.message.receive_v1":
 		try:
-			await _handle_message_event(event)
+			await _handle_message_event(event, tenant_key)
 		except Exception:
 			logger.exception("Error handling message event")
 
@@ -193,7 +198,7 @@ async def _handle_card_action_event(event: dict) -> None:
 		return
 
 	if action_type == "account_add":
-		await _notify(chat_id, '请发送: 登录 <平台> <账号名>\n例如: 登录 美团 朝阳店')
+		await _notify(chat_id, '请发送: 登录 <平台> <账号名>\n例如: 登录 美团 江湖饭焗')
 		return
 
 	if action_type == "account_refresh":
@@ -210,16 +215,26 @@ async def _handle_card_action_event(event: dict) -> None:
 		# Re-submit the task for execution
 		task = await _task_queue.get_task(task_id)
 		if task:
-			# Create a new task with same params
+			# Create a new task with all metadata from original
 			new_task = Task(
 				user_id=task.user_id,
 				chat_id=task.chat_id,
+				message_id=task.message_id,
+				tenant_key=task.tenant_key,
+				raw_text=task.raw_text,
 				platform=task.platform,
 				instruction=task.instruction,
 				account_id=task.account_id,
+				intent=task.intent,
+				intent_target=task.intent_target,
+				intent_params=task.intent_params,
+				intent_confidence=task.intent_confidence,
+				prompt_version=task.prompt_version,
+				policy_status=task.policy_status,
+				policy_reason=task.policy_reason,
+				allowed_domains=task.allowed_domains,
 			)
 			await _task_queue.submit(new_task)
-			await _pool.submit(new_task)
 			await _notify(chat_id, f"🔄 任务已重新提交\n新ID: {new_task.id[:8]}")
 		return
 
@@ -246,12 +261,22 @@ async def _handle_card_action(body: dict) -> Response:
 			new_task = Task(
 				user_id=task.user_id,
 				chat_id=task.chat_id,
+				message_id=task.message_id,
+				tenant_key=task.tenant_key,
+				raw_text=task.raw_text,
 				platform=task.platform,
 				instruction=task.instruction,
 				account_id=task.account_id,
+				intent=task.intent,
+				intent_target=task.intent_target,
+				intent_params=task.intent_params,
+				intent_confidence=task.intent_confidence,
+				prompt_version=task.prompt_version,
+				policy_status=task.policy_status,
+				policy_reason=task.policy_reason,
+				allowed_domains=task.allowed_domains,
 			)
 			await _task_queue.submit(new_task)
-			await _pool.submit(new_task)
 			return _card_response("success", f"已重新提交: {new_task.id[:8]}")
 
 	if action_type == "cancel" and task_id:
@@ -307,7 +332,7 @@ def _card_response(toast_type: str, content: str) -> Response:
 # Message event handler
 # ---------------------------------------------------------------------------
 
-async def _handle_message_event(event: dict) -> None:
+async def _handle_message_event(event: dict, tenant_key: str = "") -> None:
 	"""Handle an incoming Feishu message event."""
 	message = event.get("message", {})
 	chat_id = message.get("chat_id", "")
@@ -316,13 +341,28 @@ async def _handle_message_event(event: dict) -> None:
 	msg_type = message.get("message_type", "")
 	message_id = message.get("message_id", "")
 
-	# Only process text messages
+	# Persist attachments for future image/table-driven operations.
 	if msg_type != "text":
+		await _handle_attachment_message(
+			msg_type=msg_type,
+			content_str=message.get("content", "{}"),
+			tenant_key=tenant_key,
+			chat_id=chat_id,
+			message_id=message_id,
+			user_id=user_id,
+		)
 		return
 
 	content_str = message.get("content", "{}")
 	content = json.loads(content_str)
 	text = content.get("text", "").strip()
+
+	# Strip Feishu @mention tags
+	# Format 1: @_user_1, @_all
+	# Format 2: <at user_id="xxx">name</at>
+	text = re.sub(r"@_\w+\s*", "", text)
+	text = re.sub(r"<at\s+user_id=[^>]*>[^<]*</at>\s*", "", text)
+	text = text.strip()
 
 	if not text:
 		return
@@ -340,22 +380,110 @@ async def _handle_message_event(event: dict) -> None:
 		await _feishu_bot.reply_text(message_id, "无法理解指令。请发送如：\n朝阳店 美团 搜索咖啡\n或：登录 美团 朝阳店")
 		return
 
+	parsed_intent = IntentParser().parse(
+		raw_text=text,
+		platform=platform,
+		instruction=instruction,
+	)
+	policy_decision = PolicyGate().evaluate(
+		raw_text=text,
+		platform=platform,
+		instruction=instruction,
+	)
+	if policy_decision.status == "blocked":
+		await _feishu_bot.reply_text(
+			message_id,
+			f"⛔ 指令已拦截\n原因：{policy_decision.reason}\n请使用已支持的商家后台平台和账号。",
+		)
+		return
+
+	if policy_decision.status == "needs_confirmation":
+		await _feishu_bot.reply_text(
+			message_id,
+			f"⚠️ 该指令属于高风险操作，需要二次确认后执行。\n原因：{policy_decision.reason}\n当前版本暂未开放确认执行。",
+		)
+		return
+
 	# Build task
 	task = Task(
 		user_id=user_id,
 		chat_id=chat_id,
+		message_id=message_id,
+		tenant_key=tenant_key,
+		raw_text=text,
 		platform=platform,
 		instruction=instruction,
 		account_id=account.id if account else None,
+		intent=parsed_intent.intent,
+		intent_target=parsed_intent.target,
+		intent_params=parsed_intent.params,
+		intent_confidence=parsed_intent.confidence,
+		prompt_version=PromptRegistry.VERSION,
+		policy_status=policy_decision.status,
+		policy_reason=policy_decision.reason,
+		allowed_domains=policy_decision.allowed_domains,
 	)
 
 	await _task_queue.submit(task)
-	await _pool.submit(task)
 
-	account_info = f" (账号: {account.name})" if account else ""
+	task_card_message_id = await _feishu_bot.reply_task_card(message_id, task)
+	if task_card_message_id:
+		await _task_queue.set_task_card_message_id(task.id, task_card_message_id)
+
+
+async def _handle_attachment_message(
+	msg_type: str,
+	content_str: str,
+	tenant_key: str,
+	chat_id: str,
+	message_id: str,
+	user_id: str,
+) -> None:
+	"""Store Feishu image/file attachment metadata for future task execution."""
+	if msg_type not in {"image", "file"}:
+		return
+
+	try:
+		content = json.loads(content_str or "{}")
+	except json.JSONDecodeError:
+		content = {}
+
+	if msg_type == "image":
+		attachment = Attachment(
+			tenant_key=tenant_key,
+			chat_id=chat_id,
+			message_id=message_id,
+			uploaded_by_user_id=user_id,
+			file_type="image",
+			file_name=content.get("file_name") or "image",
+			mime_type=content.get("mime_type") or "image/*",
+			feishu_file_key=content.get("image_key"),
+			size_bytes=content.get("file_size"),
+			status="stored",
+		)
+		await _task_queue.add_attachment(attachment)
+		await _feishu_bot.reply_text(
+			message_id,
+			f"📎 已记录图片附件：{attachment.id[:8]}\n当前版本仅保存附件元数据，后续会用于商户图片更新任务。",
+		)
+		return
+
+	attachment = Attachment(
+		tenant_key=tenant_key,
+		chat_id=chat_id,
+		message_id=message_id,
+		uploaded_by_user_id=user_id,
+		file_type="file",
+		file_name=content.get("file_name"),
+		mime_type=content.get("mime_type"),
+		feishu_file_key=content.get("file_key"),
+		size_bytes=content.get("file_size"),
+		status="stored",
+	)
+	await _task_queue.add_attachment(attachment)
 	await _feishu_bot.reply_text(
 		message_id,
-		f"✅ 任务已创建\nID: {task.id[:8]}\n平台: {platform}{account_info}\n指令: {instruction}",
+		f"📎 已记录文件附件：{attachment.file_name or attachment.id[:8]}\n当前版本仅保存附件元数据，后续会用于表格/图片类运营任务。",
 	)
 
 
@@ -368,15 +496,14 @@ async def _handle_special_command(text: str, user_id: str, chat_id: str, message
 
 	Returns True if the message was handled as a special command.
 	"""
-	# Login command: "登录 <平台> <账号名>"
+	# Login command: "登录 <平台> <账号名>" or compact natural language variants.
 	if text.startswith("登录"):
-		parts = text.split(maxsplit=2)
-		if len(parts) < 3:
+		parsed_login = _parse_login_command(text)
+		if parsed_login is None:
 			await _feishu_bot.reply_text(message_id, "格式：登录 <平台> <账号名>\n例如：登录 美团 朝阳店")
 			return True
 
-		platform = _resolve_platform(parts[1])
-		account_name = parts[2]
+		platform, account_name = parsed_login
 
 		# Create or find account
 		accounts = await _account_manager.search_accounts(account_name)
@@ -412,21 +539,11 @@ async def _handle_special_command(text: str, user_id: str, chat_id: str, message
 
 	# Help command
 	if text in ("帮助", "help", "?", "？"):
-		help_text = (
-			"📖 使用帮助\n\n"
-			"🔹 执行任务：\n"
-			"  朝阳店 美团 把咖啡价格改成25\n"
-			"  美团 搜索咖啡\n\n"
-			"🔹 账号管理：\n"
-			"  账号列表 — 查看所有账号\n"
-			"  登录 美团 朝阳店 — 登录账号\n\n"
-			"🔹 任务控制：\n"
-			"  取消 — 取消运行中的任务\n"
-			"  运行中 — 查看当前任务状态\n"
-			"  历史 — 查看最近任务记录\n\n"
-			"🔹 支持平台：美团、抖音、淘宝"
-		)
-		await _feishu_bot.reply_text(message_id, help_text)
+		await _feishu_bot.reply_card(message_id, _feishu_bot.build_help_card())
+		return True
+
+	if text in ("附件", "最近附件", "uploads", "files"):
+		await _show_recent_attachments(user_id, chat_id, message_id)
 		return True
 
 	# Cancel command: "取消 <task_id>" or "取消" (cancel all running)
@@ -453,7 +570,72 @@ async def _handle_special_command(text: str, user_id: str, chat_id: str, message
 		await _show_task_history(message_id)
 		return True
 
+	if text in ("指标", "统计", "metrics"):
+		await _show_task_metrics(message_id)
+		return True
+
+	if text.startswith(("详情", "detail")):
+		parts = text.split(maxsplit=1)
+		if len(parts) < 2:
+			await _feishu_bot.reply_text(message_id, "格式：详情 <任务ID>")
+			return True
+		await _show_task_detail(parts[1].strip(), message_id)
+		return True
+
+	if text.startswith(("日志", "log")):
+		parts = text.split(maxsplit=1)
+		if len(parts) < 2:
+			await _feishu_bot.reply_text(message_id, "格式：日志 <任务ID>")
+			return True
+		await _show_task_log(parts[1].strip(), message_id)
+		return True
+
 	return False
+
+
+def _parse_login_command(text: str) -> tuple[str, str] | None:
+	"""Parse login commands with or without spaces.
+
+	Accepted examples:
+	- 登录 美团 朝阳店
+	- 登录美团朝阳店
+	- 登录美团商家后台朝阳店
+	"""
+	if not text.startswith("登录"):
+		return None
+
+	rest = text.removeprefix("登录").strip()
+	if not rest:
+		return None
+
+	parts = rest.split(maxsplit=1)
+	if len(parts) == 2:
+		platform = _resolve_platform(parts[0])
+		if platform != "general" and parts[1].strip():
+			return platform, parts[1].strip()
+
+	compact = re.sub(r"\s+", "", rest)
+	platform_keywords = sorted(
+		[*PLATFORM_ALIASES.keys(), "meituan", "douyin", "taobao"],
+		key=len,
+		reverse=True,
+	)
+
+	for keyword in platform_keywords:
+		if not compact.lower().startswith(keyword.lower()):
+			continue
+
+		platform = _resolve_platform(keyword)
+		account_name = compact[len(keyword):].strip()
+		for prefix in ("商家后台", "商家中心", "后台", "商家", "店铺", "账号"):
+			if account_name.startswith(prefix):
+				account_name = account_name[len(prefix):].strip()
+				break
+
+		if account_name:
+			return platform, account_name
+
+	return None
 
 
 async def _cancel_task_by_prefix(task_id_prefix: str, message_id: str) -> None:
@@ -577,6 +759,65 @@ async def _show_task_history(message_id: str) -> None:
 		await _feishu_bot.reply_text(message_id, "❌ 获取历史记录失败")
 
 
+async def _show_task_metrics(message_id: str) -> None:
+	"""Show aggregate task metrics."""
+	try:
+		metrics = await _task_queue.get_metrics()
+		card = _feishu_bot.build_metrics_card(metrics)
+		await _feishu_bot.reply_card(message_id, card)
+	except Exception:
+		logger.exception("Failed to show task metrics")
+		await _feishu_bot.reply_text(message_id, "❌ 获取任务指标失败")
+
+
+async def _show_recent_attachments(user_id: str, chat_id: str, message_id: str) -> None:
+	"""Show recently uploaded attachments for the current chat/user."""
+	try:
+		attachments = await _task_queue.get_recent_attachments(chat_id=chat_id, user_id=user_id)
+		card = _feishu_bot.build_attachment_card(attachments)
+		await _feishu_bot.reply_card(message_id, card)
+	except Exception:
+		logger.exception("Failed to show recent attachments")
+		await _feishu_bot.reply_text(message_id, "❌ 获取最近附件失败")
+
+
+async def _show_task_detail(task_id_prefix: str, message_id: str) -> None:
+	"""Show a task detail card by id or id prefix."""
+	try:
+		task = await _task_queue.get_task_by_prefix(task_id_prefix)
+		if not task:
+			await _feishu_bot.reply_text(message_id, f"❌ 找不到任务 {task_id_prefix}")
+			return
+		card = _feishu_bot.build_task_card(task)
+		await _feishu_bot.reply_card(message_id, card)
+	except Exception:
+		logger.exception("Failed to show task detail for %s", task_id_prefix)
+		await _feishu_bot.reply_text(message_id, "❌ 获取任务详情失败")
+
+
+async def _show_task_log(task_id_prefix: str, message_id: str) -> None:
+	"""Show a task event timeline by id or id prefix."""
+	try:
+		task = await _task_queue.get_task_by_prefix(task_id_prefix)
+		if not task:
+			await _feishu_bot.reply_text(message_id, f"❌ 找不到任务 {task_id_prefix}")
+			return
+
+		events = await _task_queue.get_events(task.id)
+		if not events:
+			await _feishu_bot.reply_text(message_id, f"📭 任务 {task.id[:8]} 暂无日志")
+			return
+
+		lines = [f"🧾 任务日志 {task.id[:8]}"]
+		for event in events:
+			time_str = event.created_at.strftime("%H:%M:%S")
+			lines.append(f"{time_str} [{event.event_type}] {event.message}")
+		await _feishu_bot.reply_text(message_id, "\n".join(lines))
+	except Exception:
+		logger.exception("Failed to show task log for %s", task_id_prefix)
+		await _feishu_bot.reply_text(message_id, "❌ 获取任务日志失败")
+
+
 # ---------------------------------------------------------------------------
 # Login flow (headful)
 # ---------------------------------------------------------------------------
@@ -696,6 +937,11 @@ async def _parse_message_with_account(text: str, user_id: str) -> tuple[str, str
 			if account:
 				return platform, instruction, account
 
+		account = await _resolve_account_in_text(remaining, platform)
+		if account:
+			instruction = _remove_account_name_from_instruction(remaining, account.name)
+			return platform, instruction or "打开", account
+
 	# No account found, return platform + full text as instruction
 	if platform:
 		return platform, remaining if remaining else text, None
@@ -732,6 +978,36 @@ async def _resolve_account(keyword: str, platform: str) -> object | None:
 
 	candidates.sort(key=_score, reverse=True)
 	return candidates[0]
+
+
+async def _resolve_account_in_text(text: str, platform: str) -> object | None:
+	"""Resolve an account whose name appears anywhere in the message text."""
+	accounts = await _account_manager.get_accounts_by_platform(platform)
+	if not accounts:
+		return None
+
+	normalized_text = re.sub(r"\s+", "", text).lower()
+	matches = [
+		account for account in accounts
+		if re.sub(r"\s+", "", account.name).lower() in normalized_text
+	]
+	if not matches:
+		return None
+
+	matches.sort(
+		key=lambda account: (
+			len(re.sub(r"\s+", "", account.name)),
+			account.last_used_at or account.created_at,
+		),
+		reverse=True,
+	)
+	return matches[0]
+
+
+def _remove_account_name_from_instruction(text: str, account_name: str) -> str:
+	"""Remove an account name from text while keeping the user's command words."""
+	instruction = text.replace(account_name, "", 1).strip()
+	return re.sub(r"\s+", " ", instruction).strip()
 
 
 # ---------------------------------------------------------------------------
